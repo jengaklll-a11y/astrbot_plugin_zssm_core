@@ -30,7 +30,6 @@ _BILI_REFERER = "https://www.bilibili.com/"
 
 
 def is_bilibili_url(url: Optional[str]) -> bool:
-    """判断是否为看起来是 B 站相关的 URL（含短链）。"""
     if not is_http_url(url):
         return False
     try:
@@ -44,7 +43,6 @@ def is_bilibili_url(url: Optional[str]) -> bool:
 
 
 def _bili_av2bv(av: str) -> Optional[str]:
-    """将 av 号字符串转换为 BV 号。"""
     m = re.search(r"\d+", av)
     if not m:
         return None
@@ -60,7 +58,6 @@ def _bili_av2bv(av: str) -> Optional[str]:
 
 
 async def _bili_resolve_b23(url: str) -> Optional[str]:
-    """解析 b23.tv / bili2233.cn 等短链，获取真实跳转后的 URL。"""
     if not isinstance(url, str) or not url:
         return None
     full = url.strip()
@@ -89,7 +86,6 @@ async def _bili_resolve_b23(url: str) -> Optional[str]:
 
 
 def _bili_extract_bvid_from_url(url: str) -> Optional[str]:
-    """从各种形式的 B 站链接中抽取 BV 号（或 av 号并转换）。"""
     if not isinstance(url, str):
         return None
     m_bv = _BILI_BV_RE.search(url)
@@ -102,7 +98,6 @@ def _bili_extract_bvid_from_url(url: str) -> Optional[str]:
 
 
 async def _bili_request_json(url: str) -> Optional[Dict[str, Any]]:
-    """以 JSON 形式请求 B 站 API，带简单 UA/Referer。"""
     headers = {
         "User-Agent": _BILI_UA,
         "Referer": _BILI_REFERER,
@@ -142,15 +137,10 @@ async def _bili_request_json(url: str) -> Optional[Dict[str, Any]]:
 
 
 async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[str]:
-    """将 B 站页面/短链解析为可下载的视频直链 URL。
-
-    仅依赖公开 API，不涉及登录态；解析失败时返回 None。
-    """
     if not is_bilibili_url(url):
         return None
 
     candidate = url
-    # 短链先展开
     if _BILI_B23_RE.search(candidate or ""):
         real = await _bili_resolve_b23(candidate)
         if isinstance(real, str) and real:
@@ -195,12 +185,6 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
 async def download_bilibili_video_to_temp(
     url: str, size_mb_limit: int, quality: int = 80
 ) -> Optional[str]:
-    """解析 B 站视频链接并下载到临时文件。
-
-    - 先通过 resolve_bilibili_video_url 获取真实文件地址；
-    - 再附带 B 站 UA/Referer 头下载到临时文件；
-    - 超过 size_mb_limit 或下载失败时返回 None。
-    """
     stream_url = await resolve_bilibili_video_url(url, quality=quality)
     if not isinstance(stream_url, str) or not stream_url:
         return None
