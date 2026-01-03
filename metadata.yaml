@@ -1,6 +1,6 @@
 name: astrbot_plugin_zssm_core
 display_name: Zssm(Core)
-desc: zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；支持抓取url内容（可绕过cf)；支持 QQ 合并转发
-version: 1.0.0
+desc: 可直接zssm解释引用内容，或使用 "zssm + 内容" 进行联网搜索
+version: 1.1.0
 author: jengaklll-a11y
 repo: https://github.com/jengaklll-a11y/astrbot_plugin_zssm_core
