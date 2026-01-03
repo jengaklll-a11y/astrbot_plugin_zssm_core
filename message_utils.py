@@ -17,34 +17,37 @@ def extract_text_and_images_from_chain(
     images: List[str] = []
     if not isinstance(chain, list):
         return ("", images)
+    
     for seg in chain:
         try:
             if isinstance(seg, Comp.Plain):
                 txt = getattr(seg, "text", None)
-                texts.append(txt if isinstance(txt, str) else str(seg))
+                if isinstance(txt, str) and txt:
+                    texts.append(txt)
             elif isinstance(seg, Comp.Image):
                 candidates: List[str] = []
+                # 尝试从各种属性中获取图片链接
                 for key in ("url", "file", "path", "src", "base64", "data"):
-                    try:
-                        v = getattr(seg, key, None)
-                    except Exception:
-                        v = None
+                    v = getattr(seg, key, None)
                     if isinstance(v, str) and v:
                         candidates.append(v)
-                try:
-                    d = getattr(seg, "data", None)
-                except Exception:
-                    d = None
+                
+                # 尝试从 data 字典中获取
+                d = getattr(seg, "data", None)
                 if isinstance(d, dict):
                     for key in ("url", "file", "path", "src", "base64", "data"):
                         v = d.get(key)
                         if isinstance(v, str) and v:
                             candidates.append(v)
+                
+                # 去重并添加
                 seen_local = set()
                 for c in candidates:
                     if c not in seen_local:
                         seen_local.add(c)
                         images.append(c)
+            
+            # 处理嵌套节点 (Node, Nodes, Forward)
             elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
                 content = getattr(seg, "content", None)
                 if isinstance(content, list):
@@ -74,6 +77,7 @@ def extract_text_and_images_from_chain(
                             images.extend(i2)
         except (AttributeError, TypeError, ValueError) as e:
             logger.warning(f"zssm_explain: parse chain segment failed: {e}")
+            
     return ("\n".join([t for t in texts if t]).strip(), images)
 
 
@@ -603,6 +607,7 @@ async def napcat_resolve_file_url(
     def _stem_if_needed(s: str) -> Optional[str]:
         try:
             base, ext = os.path.splitext(s)
+            # 仅保留图片格式，移除视频格式
             if ext and ext.lower() in (
                 ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
             ):
