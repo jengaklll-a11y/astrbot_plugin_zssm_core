@@ -1,11 +1,17 @@
 {
+  "persona_override_enabled": {
+    "description": "人格覆写",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将使用下方的人格设定覆盖默认提示词。"
+  },
   "persona_setting": {
     "description": "人格设定 (System Prompt)",
     "type": "text",
     "editor_mode": true,
     "editor_language": "markdown",
     "default": "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。\n请严格使用如下 Markdown 结构输出回答：\n1. 第一行以“关键词：”开头，列出 3~8 个核心关键词，使用“ | ”分隔。\n2. 接着给出 1~2 句总括性说明。\n3. 然后输出一行“**详细阐述：**”，在其后用若干段落进行详细解释。\n禁止输出思考过程或中间推理，只保留对用户有用的结论性内容。",
-    "hint": "自定义系统提示词，将覆盖默认的解释风格设定。"
+    "hint": "自定义人格设定提示词（仅在启用人格覆写时生效）。"
   },
   "enable_keyword_zssm": {
     "description": "是否启用“zssm”关键词自动触发",
