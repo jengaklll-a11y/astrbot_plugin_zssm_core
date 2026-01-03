@@ -39,6 +39,7 @@ FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 SEARCH_PROVIDER_ID_KEY = "search_provider_id"
 PERSONA_SETTING_KEY = "persona_setting"
+PERSONA_OVERRIDE_ENABLED_KEY = "persona_override_enabled"
 
 # 默认值
 DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
@@ -46,11 +47,11 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 
 
 @register(
-    "astrbot_zssm_explain",
-    "薄暝",
-    'zssm 消息解释与搜索助手。支持直接解释引用内容，或使用 "zssm + 内容" 进行联网搜索（需配置 Search Provider）。',
-    "v3.9.15",
-    "https://github.com/xiaoxi68/astrbot_zssm_explain",
+    "astrbot_plugin_zssm_core",
+    "jengaklll-a11y",
+    '可直接zssm解释引用内容，或使用 "zssm + 内容" 进行联网搜索',
+    "1.1.0",
+    "https://github.com/jengaklll-a11y/astrbot_plugin_zssm_core",
 )
 class ZssmExplain(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -65,27 +66,12 @@ class ZssmExplain(Star):
 
     async def initialize(self):
         """可选：插件初始化。"""
+        pass
 
     def _reply_text_result(self, event: AstrMessageEvent, text: str):
-        """构造一个显式“回复调用者”的文本消息结果。"""
-        try:
-            msg_id = None
-            try:
-                msg_id = getattr(event.message_obj, "message_id", None)
-            except Exception:
-                msg_id = None
-            if msg_id:
-                try:
-                    chain = [
-                        Comp.Reply(id=str(msg_id)),
-                        Comp.Plain(str(text) if text is not None else ""),
-                    ]
-                    return event.chain_result(chain)
-                except Exception:
-                    pass
-            return event.plain_result(str(text) if text is not None else "")
-        except Exception:
-            return event.plain_result(str(text) if text is not None else "")
+        """构造纯文本消息结果。"""
+        safe_text = str(text).strip() if text is not None else ""
+        return event.plain_result(safe_text)
 
     def _get_conf_str(self, key: str, default: str) -> str:
         try:
@@ -96,12 +82,39 @@ class ZssmExplain(Star):
             pass
         return default
 
+    def _get_conf_bool(self, key: str, default: bool) -> bool:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                lv = v.strip().lower()
+                if lv in ("1", "true", "yes", "on"):
+                    return True
+                if lv in ("0", "false", "no", "off"):
+                    return False
+        except Exception:
+            pass
+        return default
+
+    def _get_conf_int(
+        self, key: str, default: int, min_v: int = 1, max_v: int = 120000
+    ) -> int:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, int):
+                return max(min(v, max_v), min_v)
+            if isinstance(v, str) and v.strip().isdigit():
+                return max(min(int(v.strip()), max_v), min_v)
+        except Exception:
+            pass
+        return default
+
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
         if not isinstance(text, str):
             return False
         t = text.strip()
-        # 忽略常见前缀，匹配起始处 zssm
         if re.match(r"^[\s/!！。\.、，\-]*zssm(\s|$)", t, re.I):
             return True
         return False
@@ -158,7 +171,7 @@ class ZssmExplain(Star):
         content = (m.group(1) or "").strip()
         try:
             content = re.sub(
-                r"[\[【](图片|image|img|视频|video|语音|record|文件|file)[\]】]",
+                r"[\[【](图片|image|img|文件|file)[\]】]",
                 " ",
                 content,
                 flags=re.I,
@@ -292,9 +305,7 @@ class ZssmExplain(Star):
                 try:
                     ret = await call_get_msg(event, mid)
                     data = ob_data(ret or {})
-                    _t, imgs2 = extract_from_onebot_message_payload(
-                        data
-                    )
+                    _t, imgs2 = extract_from_onebot_message_payload(data)
                     for x in imgs2:
                         nx = _norm(x)
                         if nx:
@@ -306,34 +317,6 @@ class ZssmExplain(Star):
                     )
 
         return resolved
-
-    def _get_conf_bool(self, key: str, default: bool) -> bool:
-        try:
-            v = self.config.get(key) if isinstance(self.config, dict) else None
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, str):
-                lv = v.strip().lower()
-                if lv in ("1", "true", "yes", "on"):
-                    return True
-                if lv in ("0", "false", "no", "off"):
-                    return False
-        except Exception:
-            pass
-        return default
-
-    def _get_conf_int(
-        self, key: str, default: int, min_v: int = 1, max_v: int = 120000
-    ) -> int:
-        try:
-            v = self.config.get(key) if isinstance(self.config, dict) else None
-            if isinstance(v, int):
-                return max(min(v, max_v), min_v)
-            if isinstance(v, str) and v.strip().isdigit():
-                return max(min(int(v.strip()), max_v), min_v)
-        except Exception:
-            pass
-        return default
 
     def _get_file_preview_exts(self) -> Set[str]:
         raw = self._get_conf_str(FILE_PREVIEW_EXTS_KEY, DEFAULT_FILE_PREVIEW_EXTS)
@@ -358,9 +341,12 @@ class ZssmExplain(Star):
             return None
 
     def _build_system_prompt(self, event: AstrMessageEvent) -> str:
+        """构建系统提示词，根据开关决定是否使用自定义人格。"""
+        override_enabled = self._get_conf_bool(PERSONA_OVERRIDE_ENABLED_KEY, False)
         custom_persona = self._get_conf_str(PERSONA_SETTING_KEY, "")
         return build_system_prompt_for_event(
             custom_persona_setting=custom_persona,
+            override_enabled=override_enabled,
         )
 
     def _format_explain_output(
@@ -370,7 +356,9 @@ class ZssmExplain(Star):
     ) -> str:
         if not isinstance(content, str):
             content = "" if content is None else str(content)
+        
         body = content.strip()
+        
         if not body:
             return ""
 
@@ -420,21 +408,17 @@ class ZssmExplain(Star):
     ) -> _ExplainPlan:
         cleanup_paths: List[str] = []
 
-        # 1. 获取引用内容
         q_text, q_images, from_forward = await extract_quoted_payload(event)
         
-        # 2. 获取当前消息中的图片（作为补充或直接输入）
         current_images_raw = self._extract_images_from_event(event)
         try:
             current_images = await self._resolve_images_for_llm(event, current_images_raw)
         except Exception:
             current_images = []
         
-        # 合并图片
         all_images = (q_images or []) + current_images
-        all_images = list(dict.fromkeys(all_images)) # 去重
+        all_images = list(dict.fromkeys(all_images))
 
-        # 尝试获取群文件预览 (作为 Context)
         try:
             file_preview = await extract_file_preview_from_reply(
                 event,
@@ -446,12 +430,8 @@ class ZssmExplain(Star):
         except Exception:
             pass
 
-        # --- 决策逻辑 ---
-
-        # Case A: 搜索模式 (有 inline 文本)
         if inline:
             prompt = inline
-            # 如果有引用内容，作为上下文追加
             context_str = ""
             if q_text:
                 context_str += f"\n引用文本：\n{q_text}"
@@ -466,9 +446,6 @@ class ZssmExplain(Star):
                 is_search=True
             )
 
-        # Case B: 解释/处理模式 (无 inline 文本)
-        
-        # B1: 标准文本/图片解释
         if q_text or all_images:
             user_prompt = build_user_prompt(q_text, all_images)
             return self._LLMPlan(
@@ -478,7 +455,6 @@ class ZssmExplain(Star):
                 is_search=False
             )
 
-        # Case C: 空指令
         return self._ReplyPlan(
             message="请输入要解释的内容，或回复一条消息/图片/文件进行解释。\n使用 'zssm + 内容' 可进行联网搜索。",
             stop_event=True,
@@ -520,13 +496,11 @@ class ZssmExplain(Star):
             start_ts = time.perf_counter()
             
             if is_search:
-                # 搜索模式：优先使用 Search Provider
                 call_provider = self._llm.select_search_provider(
                     session_provider=provider,
                     search_provider_key=SEARCH_PROVIDER_ID_KEY
                 )
             else:
-                # 解释模式：使用 Text/Image Provider
                 call_provider = self._llm.select_primary_provider(
                     session_provider=provider, image_urls=image_urls
                 )
@@ -651,6 +625,7 @@ class ZssmExplain(Star):
             at_me = self._chain_has_at_me(chain, self_id)
         except Exception:
             at_me = False
+
         if isinstance(head, str) and head.strip():
             hs = head.strip()
             if re.match(r"^\s*/\s*zssm(\s|$)", hs, re.I):
@@ -666,6 +641,7 @@ class ZssmExplain(Star):
             text = event.get_message_str()
         except Exception:
             text = getattr(event, "message_str", "") or ""
+
         if isinstance(text, str) and text.strip():
             t = text.strip()
             if re.match(r"^\s*/\s*zssm(\s|$)", t, re.I):
