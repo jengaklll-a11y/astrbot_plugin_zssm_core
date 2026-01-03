@@ -33,11 +33,6 @@ from .message_utils import (
 
 
 def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[str]:
-    """根据配置字符串构造文本扩展名集合。
-
-    - raw: 类似 'txt,md,log' 的配置值，可为空。
-    - default_exts: 代码内置的默认扩展名集合。
-    """
     base: Set[str] = set()
     for ext in default_exts:
         e = str(ext).strip().lower()
@@ -59,11 +54,6 @@ def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[st
 
 
 def _normalize_pdf_page_text(raw: Optional[str]) -> str:
-    """将单页 PDF 提取出的原始文本整理为更适合 LLM 处理的 Markdown 段落。
-
-    - 合并同一段落内的换行，保留空行作为段落分隔
-    - 尝试保留简单的列表/编号结构
-    """
     if not isinstance(raw, str):
         return ""
     lines = [ln.rstrip() for ln in raw.splitlines()]
@@ -85,7 +75,6 @@ def _normalize_pdf_page_text(raw: Optional[str]) -> str:
         if not s:
             flush_paragraph()
             continue
-        # 列表/编号行：直接单独成段，避免被错误合并
         if bullet_pattern.match(s):
             flush_paragraph()
             blocks.append(s)
@@ -97,16 +86,9 @@ def _normalize_pdf_page_text(raw: Optional[str]) -> str:
 
 
 def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
-    """将 PDF 二进制内容转换为简单 Markdown 文本。
-
-    - 按页生成 `### 第 N 页` 标题
-    - 每页内部按段落拆分，合并过多换行
-    - max_pages 为正数时，仅转换前若干页
-    """
     if not data:
         return ""
 
-    # 优先使用 PyMuPDF 的 markdown 输出，保留原有章节标题结构
     if fitz is not None:
         try:
             doc = fitz.open(stream=data, filetype="pdf")  # type: ignore[arg-type]
@@ -118,7 +100,6 @@ def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
                     break
                 try:
                     page = doc.load_page(idx)
-                    # 直接使用 PyMuPDF 的 markdown 模式，保留标题/列表等结构
                     md = page.get_text("markdown") or page.get_text("text")
                 except Exception:
                     md = ""
@@ -128,10 +109,9 @@ def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
                     md_pages.append(f"### 第 {page_no} 页\n\n{md}")
             if md_pages:
                 return "\n\n---\n\n".join(md_pages).strip()
-        except Exception as e:  # pragma: no cover - 环境可能无 PyMuPDF
+        except Exception as e:
             logger.warning(f"zssm_explain: PyMuPDF markdown extract failed: {e}")
 
-    # 回退到 PyPDF2 的纯文本提取，再做简单 Markdown 规整
     if PyPDF2 is None:
         return ""
     try:
@@ -155,7 +135,6 @@ def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
 
 
 def _find_first_file_in_message_list(msg_list: List[Any]) -> Optional[Dict[str, Any]]:
-    """在 OneBot/Napcat 消息段列表中查找首个 type=file 段，支持简单嵌套 content/message。"""
     if not isinstance(msg_list, list):
         return None
     for seg in msg_list:
@@ -177,7 +156,6 @@ def _find_first_file_in_message_list(msg_list: List[Any]) -> Optional[Dict[str, 
 
 
 def _find_first_file_in_forward_payload(payload: Any) -> Optional[Dict[str, Any]]:
-    """在 OneBot get_forward_msg 返回的结构中查找首个文件段。"""
     data = ob_data(payload) if isinstance(payload, dict) else {}
     if not isinstance(data, dict):
         return None
@@ -208,10 +186,6 @@ async def extract_file_preview_from_reply(
     text_exts: Set[str],
     max_size_bytes: Optional[int] = None,
 ) -> Optional[str]:
-    """尝试从被回复的 Napcat 文件消息中构造文件内容预览文本。
-
-    仅在 OneBot/Napcat 平台 (aiocqhttp) 且存在 Reply 组件时生效。
-    """
     try:
         platform = event.get_platform_name()
     except Exception:
@@ -219,7 +193,6 @@ async def extract_file_preview_from_reply(
     if platform != "aiocqhttp" or not hasattr(event, "bot"):
         return None
 
-    # 定位 Reply 组件
     try:
         chain = event.get_messages()
     except Exception:
@@ -243,7 +216,6 @@ async def extract_file_preview_from_reply(
     if not reply_id:
         return None
 
-    # 调用 get_msg 获取原始消息，查找其中的 file 段
     try:
         ret = await call_get_msg(event, reply_id)
     except Exception:
@@ -255,10 +227,8 @@ async def extract_file_preview_from_reply(
     if not isinstance(msg_list, list):
         return None
 
-    # 1) 优先在原始消息的顶层段中查找文件
     file_seg = _find_first_file_in_message_list(msg_list)
 
-    # 2) 若未找到文件，尝试处理 Napcat “合并转发”场景：查找 forward 段并通过 get_forward_msg 拉取节点
     if not file_seg:
         for seg in msg_list:
             try:
@@ -315,11 +285,6 @@ async def build_group_file_preview(
     text_exts: Set[str],
     max_size_bytes: Optional[int] = None,
 ) -> Optional[str]:
-    """获取群文件下载链接，尝试读取文本内容片段并构造预览。
-
-    text_exts 为允许尝试内容预览的扩展名集合（包含点，如 '.txt'）。
-    """
-    # 仅支持群聊场景，私聊暂不处理
     try:
         gid = event.get_group_id()
     except Exception:
@@ -327,7 +292,6 @@ async def build_group_file_preview(
 
     url: Optional[str] = None
 
-    # 群聊：优先使用 get_group_file_url
     if gid:
         try:
             group_id = int(gid)
@@ -344,7 +308,6 @@ async def build_group_file_preview(
             except Exception as e:
                 logger.warning(f"zssm_explain: get_group_file_url failed: {e}")
 
-    # 私聊或群聊兜底：使用 get_private_file_url
     if not url:
         try:
             url_result = await event.bot.api.call_action(
@@ -357,12 +320,10 @@ async def build_group_file_preview(
         except Exception as e:
             logger.warning(f"zssm_explain: get_private_file_url failed: {e}")
 
-    # 元信息部分（即使无法下载，也可以使用）
     meta_lines: List[str] = [f"[群文件] {file_name}"]
     if summary:
         meta_lines.append(f"说明: {summary}")
 
-    # 仅对配置允许的文本扩展名或 PDF 尝试内容预览
     if not url or aiohttp is None:
         return "\n".join(meta_lines)
 
@@ -370,7 +331,6 @@ async def build_group_file_preview(
     _, ext = os.path.splitext(name_lower)
     is_pdf = ext == ".pdf"
     if ext not in text_exts and not is_pdf:
-        # 非文本类/非 PDF 文件暂不尝试解析内容
         return "\n".join(meta_lines)
 
     snippet = ""
@@ -395,7 +355,6 @@ async def build_group_file_preview(
                                 size_hint = f"{sz / 1024:.1f} KB"
                             else:
                                 size_hint = f"{sz / 1024 / 1024:.2f} MB"
-                            # 若为非 PDF 文件且配置了最大文件大小，且当前文件超出阈值，则仅返回元信息
                             if (
                                 not is_pdf
                                 and isinstance(max_size_bytes, int)
@@ -407,9 +366,7 @@ async def build_group_file_preview(
                                     "（文件体积较大，已跳过内容预览，仅展示元信息）"
                                 )
                                 return "\n".join(meta_lines)
-                    # PDF：尝试使用 PyPDF2 将内容转换为 Markdown 文本
                     if is_pdf and PyPDF2 is not None:
-                        # 固定读取不超过约 2MB 的二进制内容，再按转换后的 Markdown 文本大小与全局限制比较
                         limit = 2 * 1024 * 1024
                         buf = io.BytesIO()
                         total = 0
@@ -429,7 +386,6 @@ async def build_group_file_preview(
                             )
                             text = ""
                         if text:
-                            # 对于 PDF，按提取出的 Markdown 文本大小进行限制，而非 PDF 文件体积
                             if isinstance(max_size_bytes, int) and max_size_bytes > 0:
                                 try:
                                     txt_bytes = len(
@@ -448,7 +404,6 @@ async def build_group_file_preview(
                                 text if len(text) <= 400 else (text[:400] + " ...")
                             )
                     else:
-                        # 纯文本类文件：读取前 4KB 作为预览
                         max_bytes = 4096
                         data = await resp.content.read(max_bytes)
                         try:
