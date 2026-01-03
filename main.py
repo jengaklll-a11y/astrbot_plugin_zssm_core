@@ -9,7 +9,7 @@ import shutil
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.core.star.star_handler import EventType
@@ -33,30 +33,56 @@ from .file_preview_utils import (
     extract_file_preview_from_reply,
 )
 
-# 配置 Key
+# 配置 Key 常量
 KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 SEARCH_PROVIDER_ID_KEY = "search_provider_id"
 PERSONA_SETTING_KEY = "persona_setting"
 PERSONA_OVERRIDE_ENABLED_KEY = "persona_override_enabled"
+ZSSM_HANDLED_KEY = "zssm_handled"
 
 # 默认值
 DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 
-
-@register(
-    "astrbot_plugin_zssm_core",
-    "jengaklll-a11y",
-    '可直接zssm解释引用内容，或使用 "zssm + 内容" 进行联网搜索',
-    "1.1.0",
-    "https://github.com/jengaklll-a11y/astrbot_plugin_zssm_core",
+# 触发正则模式（预编译以提高性能）
+ZSSM_TRIGGER_PATTERN = re.compile(r"^[\s/!！。\.、，\-]{0,10}zssm(?:\s|$)", re.I)
+ZSSM_COMMAND_PATTERN = re.compile(r"^\s*/\s*zssm(?:\s|$)", re.I)
+ZSSM_CONTENT_PATTERN = re.compile(r"^[\s/!！。\.、，\-]{0,10}zssm(?:\s+(.+))?$", re.I)
+BRACKET_IMAGE_PATTERN = re.compile(
+    r"[\[【](图片|image|img|文件|file)[\]】]",
+    flags=re.I,
 )
+MULTI_SPACE_PATTERN = re.compile(r"\s{2,}")
+
+
+@dataclass
+class LLMPlan:
+    """LLM 调用计划"""
+    user_prompt: str
+    images: List[str] = field(default_factory=list)
+    cleanup_paths: List[str] = field(default_factory=list)
+    is_search: bool = False
+
+
+@dataclass
+class ReplyPlan:
+    """直接回复计划"""
+    message: str
+    stop_event: bool = True
+    cleanup_paths: List[str] = field(default_factory=list)
+
+
+ExplainPlan = Union[LLMPlan, ReplyPlan]
+
+
 class ZssmExplain(Star):
+    """Zssm 解释插件主类"""
+
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
-        self.config: Dict[str, Any] = config or {}
+        self.config: Dict[str, Any] = config if config is not None else {}
         self._llm = LLMClient(
             context=self.context,
             get_conf_int=self._get_conf_int,
@@ -64,27 +90,25 @@ class ZssmExplain(Star):
             logger=logger,
         )
 
-    async def initialize(self):
-        """可选：插件初始化。"""
-        pass
-
     def _reply_text_result(self, event: AstrMessageEvent, text: str):
         """构造纯文本消息结果。"""
         safe_text = str(text).strip() if text is not None else ""
         return event.plain_result(safe_text)
 
     def _get_conf_str(self, key: str, default: str) -> str:
+        """获取字符串配置项"""
         try:
-            v = self.config.get(key) if isinstance(self.config, dict) else None
+            v = self.config.get(key)
             if isinstance(v, str):
                 return v.strip()
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         return default
 
     def _get_conf_bool(self, key: str, default: bool) -> bool:
+        """获取布尔配置项"""
         try:
-            v = self.config.get(key) if isinstance(self.config, dict) else None
+            v = self.config.get(key)
             if isinstance(v, bool):
                 return v
             if isinstance(v, str):
@@ -93,34 +117,38 @@ class ZssmExplain(Star):
                     return True
                 if lv in ("0", "false", "no", "off"):
                     return False
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         return default
 
     def _get_conf_int(
         self, key: str, default: int, min_v: int = 1, max_v: int = 120000
     ) -> int:
+        """获取整数配置项"""
         try:
-            v = self.config.get(key) if isinstance(self.config, dict) else None
+            v = self.config.get(key)
             if isinstance(v, int):
                 return max(min(v, max_v), min_v)
             if isinstance(v, str) and v.strip().isdigit():
                 return max(min(int(v.strip()), max_v), min_v)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             pass
         return default
 
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
+        """检查文本是否触发 zssm"""
         if not isinstance(text, str):
             return False
         t = text.strip()
-        if re.match(r"^[\s/!！。\.、，\-]*zssm(\s|$)", t, re.I):
-            return True
-        return False
+        # 限制输入长度以防止 ReDoS
+        if len(t) > 500:
+            t = t[:500]
+        return bool(ZSSM_TRIGGER_PATTERN.match(t))
 
     @staticmethod
     def _first_plain_head_text(chain: List[object]) -> str:
+        """获取消息链中第一个纯文本段落"""
         if not isinstance(chain, list):
             return ""
         for seg in chain:
@@ -135,6 +163,7 @@ class ZssmExplain(Star):
 
     @staticmethod
     def _chain_has_at_me(chain: List[object], self_id: str) -> bool:
+        """检查消息链中是否有 @自己"""
         if not isinstance(chain, list):
             return False
         for seg in chain:
@@ -148,51 +177,41 @@ class ZssmExplain(Star):
         return False
 
     def _already_handled(self, event: AstrMessageEvent) -> bool:
+        """检查事件是否已处理过"""
         try:
             extras = event.get_extra()
-            if isinstance(extras, dict) and extras.get("zssm_handled"):
+            if isinstance(extras, dict) and extras.get(ZSSM_HANDLED_KEY):
                 return True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         try:
-            event.set_extra("zssm_handled", True)
-        except Exception:
+            event.set_extra(ZSSM_HANDLED_KEY, True)
+        except (AttributeError, TypeError):
             pass
         return False
 
     @staticmethod
     def _strip_trigger_and_get_content(text: str) -> str:
+        """从触发文本中提取内容"""
         if not isinstance(text, str):
             return ""
         t = text.strip()
-        m = re.match(r"^[\s/!！。\.、，\-]*zssm(?:\s+(.+))?$", t, re.I)
+        # 限制输入长度
+        if len(t) > 2000:
+            t = t[:2000]
+        m = ZSSM_CONTENT_PATTERN.match(t)
         if not m:
             return ""
         content = (m.group(1) or "").strip()
-        try:
-            content = re.sub(
-                r"[\[【](图片|image|img|文件|file)[\]】]",
-                " ",
-                content,
-                flags=re.I,
-            )
-        except Exception:
-            pass
-        try:
-            content = re.sub(r"\s{2,}", " ", content).strip()
-        except Exception:
-            content = content.strip()
+        # 移除图片/文件标记
+        content = BRACKET_IMAGE_PATTERN.sub(" ", content)
+        # 合并多个空格
+        content = MULTI_SPACE_PATTERN.sub(" ", content).strip()
         return content
 
     def _get_inline_content(self, event: AstrMessageEvent) -> str:
-        try:
-            chain = event.get_messages()
-        except Exception:
-            chain = (
-                getattr(event.message_obj, "message", [])
-                if hasattr(event, "message_obj")
-                else []
-            )
+        """获取内联内容"""
+        chain = self._safe_get_chain(event)
         head = self._first_plain_head_text(chain)
         if head:
             c = self._strip_trigger_and_get_content(head)
@@ -200,15 +219,16 @@ class ZssmExplain(Star):
                 return c
         try:
             s = event.get_message_str()
-        except Exception:
+        except (AttributeError, TypeError):
             s = getattr(event, "message_str", "") or ""
         return self._strip_trigger_and_get_content(s)
 
     @staticmethod
     def _safe_get_chain(event: AstrMessageEvent) -> List[object]:
+        """安全获取消息链"""
         try:
             return event.get_messages()
-        except Exception:
+        except (AttributeError, TypeError):
             return (
                 getattr(event.message_obj, "message", [])
                 if hasattr(event, "message_obj")
@@ -216,16 +236,19 @@ class ZssmExplain(Star):
             )
 
     def _extract_images_from_event(self, event: AstrMessageEvent) -> List[str]:
+        """从事件中提取图片"""
         chain = self._safe_get_chain(event)
         try:
             _t, images = extract_text_and_images_from_chain(chain)
-        except Exception:
+        except (ValueError, TypeError):
             images = []
         return [x for x in images if isinstance(x, str) and x]
 
     async def _resolve_images_for_llm(
         self, event: AstrMessageEvent, images: List[str]
     ) -> List[str]:
+        """解析图片 URL 供 LLM 使用"""
+
         def _norm(x: object) -> Optional[str]:
             if not isinstance(x, str) or not x:
                 return None
@@ -244,18 +267,18 @@ class ZssmExplain(Star):
                         fp = fp[1:]
                     if fp and os.path.exists(fp):
                         return os.path.abspath(fp)
-                except Exception:
+                except OSError:
                     return None
                 return None
             try:
                 if os.path.exists(s):
                     return os.path.abspath(s)
-            except Exception:
+            except OSError:
                 return None
             return None
 
         resolved: List[str] = []
-        seen = set()
+        seen: Set[str] = set()
 
         def _add(cand: str) -> None:
             if cand and cand not in seen:
@@ -280,7 +303,8 @@ class ZssmExplain(Star):
                 async with sem:
                     try:
                         return await napcat_resolve_file_url(event, fid)
-                    except Exception:
+                    except (asyncio.TimeoutError, ConnectionError) as e:
+                        logger.debug(f"zssm_explain: resolve file url failed: {e}")
                         return None
 
             tasks = [_resolve_one(fid) for fid in resolve_candidates]
@@ -299,7 +323,7 @@ class ZssmExplain(Star):
             try:
                 mid = getattr(event.message_obj, "message_id", None)
                 mid = str(mid) if mid is not None else ""
-            except Exception:
+            except (AttributeError, TypeError):
                 mid = ""
             if mid:
                 try:
@@ -310,7 +334,7 @@ class ZssmExplain(Star):
                         nx = _norm(x)
                         if nx:
                             _add(nx)
-                except Exception as e:
+                except (asyncio.TimeoutError, ConnectionError) as e:
                     logger.debug(
                         "zssm_explain: get_msg fallback for current images failed: %s",
                         e,
@@ -319,6 +343,7 @@ class ZssmExplain(Star):
         return resolved
 
     def _get_file_preview_exts(self) -> Set[str]:
+        """获取文件预览扩展名集合"""
         raw = self._get_conf_str(FILE_PREVIEW_EXTS_KEY, DEFAULT_FILE_PREVIEW_EXTS)
         base_default = [
             ext.strip() for ext in DEFAULT_FILE_PREVIEW_EXTS.split(",") if ext.strip()
@@ -326,6 +351,7 @@ class ZssmExplain(Star):
         return build_text_exts_from_config(raw, base_default)
 
     def _get_file_preview_max_bytes(self) -> Optional[int]:
+        """获取文件预览最大字节数"""
         try:
             kb = self._get_conf_int(
                 FILE_PREVIEW_MAX_SIZE_KB_KEY,
@@ -333,15 +359,12 @@ class ZssmExplain(Star):
                 1,
                 1024 * 1024,
             )
-        except Exception:
-            kb = DEFAULT_FILE_PREVIEW_MAX_SIZE_KB
-        try:
             return int(kb) * 1024
-        except Exception:
+        except (ValueError, TypeError):
             return None
 
     def _build_system_prompt(self, event: AstrMessageEvent) -> str:
-        """构建系统提示词，根据开关决定是否使用自定义人格。"""
+        """构建系统提示词"""
         override_enabled = self._get_conf_bool(PERSONA_OVERRIDE_ENABLED_KEY, False)
         custom_persona = self._get_conf_str(PERSONA_SETTING_KEY, "")
         return build_system_prompt_for_event(
@@ -354,11 +377,12 @@ class ZssmExplain(Star):
         content: str,
         elapsed_sec: Optional[float] = None,
     ) -> str:
+        """格式化解释输出"""
         if not isinstance(content, str):
             content = "" if content is None else str(content)
-        
+
         body = content.strip()
-        
+
         if not body:
             return ""
 
@@ -370,52 +394,39 @@ class ZssmExplain(Star):
         return "\n".join(parts)
 
     def _get_config_provider(self, key: str) -> Optional[Any]:
+        """根据配置键获取 Provider"""
         try:
-            pid = self.config.get(key) if isinstance(self.config, dict) else None
+            pid = self.config.get(key)
             if isinstance(pid, str):
                 pid = pid.strip()
             if pid:
                 try:
                     return self.context.get_provider_by_id(provider_id=pid)
-                except Exception as e:
+                except (ValueError, KeyError) as e:
                     logger.warning(
                         f"zssm_explain: provider id not found for {key}={pid}: {e}"
                     )
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         return None
-
-    @dataclass
-    class _LLMPlan:
-        user_prompt: str
-        images: List[str] = field(default_factory=list)
-        cleanup_paths: List[str] = field(default_factory=list)
-        is_search: bool = False
-
-    @dataclass
-    class _ReplyPlan:
-        message: str
-        stop_event: bool = True
-        cleanup_paths: List[str] = field(default_factory=list)
-
-    _ExplainPlan = Union[_LLMPlan, _ReplyPlan]
 
     async def _build_explain_plan(
         self,
         event: AstrMessageEvent,
         *,
         inline: str,
-    ) -> _ExplainPlan:
+    ) -> ExplainPlan:
+        """构建解释计划"""
         cleanup_paths: List[str] = []
 
         q_text, q_images, from_forward = await extract_quoted_payload(event)
-        
+
         current_images_raw = self._extract_images_from_event(event)
         try:
             current_images = await self._resolve_images_for_llm(event, current_images_raw)
-        except Exception:
+        except (asyncio.TimeoutError, ConnectionError):
             current_images = []
-        
+
         all_images = (q_images or []) + current_images
         all_images = list(dict.fromkeys(all_images))
 
@@ -427,48 +438,48 @@ class ZssmExplain(Star):
             )
             if file_preview:
                 q_text = f"{file_preview}\n\n{q_text}" if q_text else file_preview
-        except Exception:
-            pass
+        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            logger.debug(f"zssm_explain: file preview extraction failed: {e}")
 
         if inline:
             prompt = inline
             context_str = ""
             if q_text:
                 context_str += f"\n引用文本：\n{q_text}"
-            
+
             if context_str:
                 prompt += f"\n\n【上下文信息】{context_str}"
 
-            return self._LLMPlan(
+            return LLMPlan(
                 user_prompt=prompt,
                 images=all_images,
                 cleanup_paths=cleanup_paths,
-                is_search=True
+                is_search=True,
             )
 
         if q_text or all_images:
             user_prompt = build_user_prompt(q_text, all_images)
-            return self._LLMPlan(
+            return LLMPlan(
                 user_prompt=user_prompt,
                 images=all_images,
                 cleanup_paths=cleanup_paths,
-                is_search=False
+                is_search=False,
             )
 
-        return self._ReplyPlan(
+        return ReplyPlan(
             message="请输入要解释的内容，或回复一条消息/图片/文件进行解释。\n使用 'zssm + 内容' 可进行联网搜索。",
             stop_event=True,
             cleanup_paths=cleanup_paths,
         )
 
-    async def _execute_explain_plan(self, event: AstrMessageEvent, plan: _ExplainPlan):
-        """执行解释计划。"""
-        if isinstance(plan, self._ReplyPlan):
+    async def _execute_explain_plan(self, event: AstrMessageEvent, plan: ExplainPlan):
+        """执行解释计划"""
+        if isinstance(plan, ReplyPlan):
             yield self._reply_text_result(event, plan.message)
             if plan.stop_event:
                 try:
                     event.stop_event()
-                except Exception:
+                except (AttributeError, TypeError):
                     pass
             return
 
@@ -478,7 +489,7 @@ class ZssmExplain(Star):
 
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
-        except Exception as e:
+        except (ValueError, KeyError) as e:
             logger.error(f"zssm_explain: get provider failed: {e}")
             provider = None
 
@@ -489,16 +500,16 @@ class ZssmExplain(Star):
             return
 
         system_prompt = self._build_system_prompt(event)
-        
+
         image_urls = self._llm.filter_supported_images(images)
 
         try:
             start_ts = time.perf_counter()
-            
+
             if is_search:
                 call_provider = self._llm.select_search_provider(
                     session_provider=provider,
-                    search_provider_key=SEARCH_PROVIDER_ID_KEY
+                    search_provider_key=SEARCH_PROVIDER_ID_KEY,
                 )
             else:
                 call_provider = self._llm.select_primary_provider(
@@ -515,7 +526,7 @@ class ZssmExplain(Star):
 
             try:
                 await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
 
             reply_text = None
@@ -523,7 +534,7 @@ class ZssmExplain(Star):
                 ct = getattr(llm_resp, "completion_text", None)
                 if isinstance(ct, str) and ct.strip():
                     reply_text = ct.strip()
-            except Exception:
+            except (AttributeError, TypeError):
                 reply_text = None
             if not reply_text:
                 reply_text = self._llm.pick_llm_text(llm_resp)
@@ -531,13 +542,13 @@ class ZssmExplain(Star):
             elapsed = None
             try:
                 elapsed = time.perf_counter() - start_ts
-            except Exception:
+            except (ValueError, TypeError):
                 elapsed = None
             reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
             yield self._reply_text_result(event, reply_text)
             try:
                 event.stop_event()
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
         except asyncio.TimeoutError:
             yield self._reply_text_result(
@@ -545,17 +556,30 @@ class ZssmExplain(Star):
             )
             try:
                 event.stop_event()
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
-        except Exception as e:
+        except (ConnectionError, RuntimeError) as e:
             logger.error(f"zssm_explain: LLM 调用失败: {e}")
             yield self._reply_text_result(
                 event, "处理失败：模型调用异常，请稍后再试或联系管理员。"
             )
             try:
                 event.stop_event()
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
+
+    def _cleanup_paths(self, paths: List[str]) -> None:
+        """清理临时文件和目录"""
+        for p in paths:
+            if not isinstance(p, str) or not p:
+                continue
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                elif os.path.isfile(p):
+                    os.remove(p)
+            except OSError as e:
+                logger.debug(f"zssm_explain: cleanup path failed: {p}, error: {e}")
 
     @filter.command("zssm", alias={"知识说明", "解释"})
     async def zssm(self, event: AstrMessageEvent):
@@ -567,40 +591,25 @@ class ZssmExplain(Star):
 
             inline = self._get_inline_content(event)
 
-            plan = await self._build_explain_plan(
-                event, inline=inline
-            )
-            try:
-                cleanup_paths = list(getattr(plan, "cleanup_paths", []) or [])
-            except Exception:
-                cleanup_paths = []
+            plan = await self._build_explain_plan(event, inline=inline)
+            cleanup_paths = list(getattr(plan, "cleanup_paths", []) or [])
 
             async for r in self._execute_explain_plan(event, plan):
                 yield r
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             logger.error("zssm_explain: handler crashed: %s", e)
             yield self._reply_text_result(
                 event, "解释失败：插件内部异常，请稍后再试或联系管理员。"
             )
             try:
                 event.stop_event()
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
         finally:
-            try:
-                for p in cleanup_paths:
-                    try:
-                        if isinstance(p, str) and p:
-                            if os.path.isdir(p):
-                                shutil.rmtree(p, ignore_errors=True)
-                            elif os.path.isfile(p):
-                                os.remove(p)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            self._cleanup_paths(cleanup_paths)
 
     async def terminate(self):
+        """插件终止"""
         return
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -609,44 +618,37 @@ class ZssmExplain(Star):
         if not self._get_conf_bool(KEYWORD_ZSSM_ENABLE_KEY, True):
             return
 
-        try:
-            chain = event.get_messages()
-        except Exception:
-            chain = (
-                getattr(event.message_obj, "message", [])
-                if hasattr(event, "message_obj")
-                else []
-            )
+        chain = self._safe_get_chain(event)
         head = self._first_plain_head_text(chain)
-        
+
         at_me = False
         try:
             self_id = event.get_self_id()
             at_me = self._chain_has_at_me(chain, self_id)
-        except Exception:
+        except (AttributeError, TypeError):
             at_me = False
 
         if isinstance(head, str) and head.strip():
             hs = head.strip()
-            if re.match(r"^\s*/\s*zssm(\s|$)", hs, re.I):
+            if ZSSM_COMMAND_PATTERN.match(hs):
                 return
-            if at_me and re.match(r"^zssm(\s|$)", hs, re.I):
+            if at_me and re.match(r"^zssm(?:\s|$)", hs, re.I):
                 return
             if self._is_zssm_trigger(hs):
                 async for r in self.zssm(event):
                     yield r
                 return
-        
+
         try:
             text = event.get_message_str()
-        except Exception:
+        except (AttributeError, TypeError):
             text = getattr(event, "message_str", "") or ""
 
         if isinstance(text, str) and text.strip():
             t = text.strip()
-            if re.match(r"^\s*/\s*zssm(\s|$)", t, re.I):
+            if ZSSM_COMMAND_PATTERN.match(t):
                 return
-            if at_me and re.match(r"^zssm(\s|$)", t, re.I):
+            if at_me and re.match(r"^zssm(?:\s|$)", t, re.I):
                 return
             if self._is_zssm_trigger(t):
                 async for r in self.zssm(event):
