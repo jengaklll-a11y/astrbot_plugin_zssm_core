@@ -26,33 +26,36 @@ class LLMClient:
         self._logger = logger
 
     def filter_supported_images(self, images: List[str]) -> List[str]:
+        """过滤支持的图片格式"""
         ok: List[str] = []
         for x in images:
             try:
-                if isinstance(x, str) and x:
-                    lx = x.lower()
-                    if lx.startswith(("http://", "https://")):
-                        ok.append(x)
-                    elif lx.startswith("base64://") or lx.startswith("data:image/"):
-                        ok.append(x)
-                    elif lx.startswith("file://"):
-                        try:
-                            fp = x[7:]
-                            if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
-                                fp = fp[1:]
-                            if fp and os.path.exists(fp):
-                                ok.append(os.path.abspath(fp))
-                        except Exception:
-                            pass
-                    elif os.path.exists(x):
-                        ok.append(os.path.abspath(x))
-            except Exception as e:
+                if not isinstance(x, str) or not x:
+                    continue
+                lx = x.lower()
+                if lx.startswith(("http://", "https://")):
+                    ok.append(x)
+                elif lx.startswith("base64://") or lx.startswith("data:image/"):
+                    ok.append(x)
+                elif lx.startswith("file://"):
+                    try:
+                        fp = x[7:]
+                        if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
+                            fp = fp[1:]
+                        if fp and os.path.exists(fp):
+                            ok.append(os.path.abspath(fp))
+                    except OSError:
+                        pass
+                elif os.path.exists(x):
+                    ok.append(os.path.abspath(x))
+            except OSError as e:
                 if self._logger:
-                    self._logger.warning(f"Error checking image support for {x}: {e}")
+                    self._logger.debug(f"Error checking image support for {x}: {e}")
         return ok
 
     @staticmethod
     def provider_supports_image(provider: Any) -> bool:
+        """检查 Provider 是否支持图片"""
         try:
             mods = getattr(provider, "modalities", None)
             if isinstance(mods, (list, tuple)):
@@ -86,7 +89,8 @@ class LLMClient:
         return False
 
     @staticmethod
-    def _provider_label(provider: Any) -> str:
+    def _get_provider_label(provider: Any) -> str:
+        """获取 Provider 标签"""
         if provider is None:
             return "None"
         for key in ("provider_id", "id", "name"):
@@ -94,11 +98,11 @@ class LLMClient:
                 v = getattr(provider, key, None)
                 if isinstance(v, str) and v.strip():
                     return v.strip()
-            except Exception:
+            except (AttributeError, TypeError):
                 continue
         try:
             return provider.__class__.__name__
-        except Exception:
+        except (AttributeError, TypeError):
             return "unknown_provider"
 
     def select_primary_provider(
@@ -109,6 +113,7 @@ class LLMClient:
         text_provider_key: str = "text_provider_id",
         image_provider_key: str = "image_provider_id",
     ) -> Any:
+        """选择主要 Provider"""
         images_present = bool(image_urls)
         if images_present:
             cfg_img = self._get_provider_from_config(image_provider_key)
@@ -126,6 +131,7 @@ class LLMClient:
         preferred_provider: Optional[Any] = None,
         preferred_provider_key: Optional[str] = None,
     ) -> Any:
+        """选择视觉 Provider"""
         pp = preferred_provider
         if pp is None and preferred_provider_key:
             pp = self._get_provider_from_config(preferred_provider_key)
@@ -135,7 +141,7 @@ class LLMClient:
             return session_provider
         try:
             providers = self._context.get_all_providers()
-        except Exception:
+        except (AttributeError, TypeError):
             providers = []
         for p in providers:
             if p is session_provider:
@@ -148,18 +154,19 @@ class LLMClient:
         self,
         *,
         session_provider: Any,
-        search_provider_key: str = "search_provider_id"
+        search_provider_key: str = "search_provider_id",
     ) -> Any:
         """选择搜索专用的 Provider。如果未配置，回退到会话 Provider。"""
         cfg_search = self._get_provider_from_config(search_provider_key)
         return cfg_search if cfg_search is not None else session_provider
 
     def _get_provider_from_config(self, key: str) -> Optional[Any]:
+        """从配置获取 Provider"""
         if not self._get_config_provider:
             return None
         try:
             return self._get_config_provider(key)
-        except Exception:
+        except (ValueError, KeyError, TypeError):
             return None
 
     async def call_with_fallback(
@@ -171,7 +178,8 @@ class LLMClient:
         system_prompt: str,
         image_urls: List[str],
     ) -> Any:
-        tried = set()
+        """带回退的 LLM 调用"""
+        tried: set = set()
         images_present = bool(image_urls)
         timeout_sec = self._get_conf_int(
             LLM_TIMEOUT_SEC_KEY, DEFAULT_LLM_TIMEOUT_SEC, 5, 600
@@ -185,15 +193,16 @@ class LLMClient:
             if len(errors) >= 8:
                 return
             try:
-                label = self._provider_label(p)
-            except Exception:
+                label = self._get_provider_label(p)
+            except (AttributeError, TypeError):
                 label = "unknown_provider"
             try:
                 msg = str(e).replace("\n", " ").strip()
-            except Exception:
+            except (ValueError, TypeError):
                 msg = ""
+            # 安全截断：按字符截断，避免在多字节字符中间断开
             if len(msg) > 240:
-                msg = msg[:240] + "..."
+                msg = msg[:237] + "..."
             errors.append(f"{label}: {e.__class__.__name__}: {msg}")
 
         async def _try_call(p: Any) -> Any:
@@ -211,7 +220,7 @@ class LLMClient:
             tried.add(id(primary))
             try:
                 return await _try_call(primary)
-            except Exception as e:
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError) as e:
                 _record(primary, e)
 
         if session_provider is not None and id(session_provider) not in tried:
@@ -219,12 +228,12 @@ class LLMClient:
             try:
                 if not images_present or self.provider_supports_image(session_provider):
                     return await _try_call(session_provider)
-            except Exception as e:
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError) as e:
                 _record(session_provider, e)
 
         try:
             providers = self._context.get_all_providers()
-        except Exception:
+        except (AttributeError, TypeError):
             providers = []
         for p in providers:
             if id(p) in tried:
@@ -240,7 +249,7 @@ class LLMClient:
                         "vision" if images_present else "text",
                     )
                 return resp
-            except Exception as e:
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError) as e:
                 _record(p, e)
                 continue
 
@@ -258,7 +267,7 @@ class LLMClient:
             sample_errors = errors[:max_samples]
             sample_errors_str = "; ".join(sample_errors)
             if len(sample_errors_str) > 500:
-                sample_errors_str = sample_errors_str[:500] + "..."
+                sample_errors_str = sample_errors_str[:497] + "..."
             if len(errors) > max_samples:
                 sample_errors_str += f" (and {len(errors) - max_samples} more)"
         raise RuntimeError(
@@ -268,6 +277,7 @@ class LLMClient:
 
     @staticmethod
     def pick_llm_text(llm_resp: object) -> str:
+        """从 LLM 响应中提取文本"""
         try:
             rc = getattr(llm_resp, "result_chain", None)
             chain = getattr(rc, "chain", None)
@@ -278,11 +288,11 @@ class LLMClient:
                         txt = getattr(seg, "text", None)
                         if isinstance(txt, str) and txt.strip():
                             parts.append(txt.strip())
-                    except Exception:
+                    except (AttributeError, TypeError):
                         pass
                 if parts:
                     return "\n".join(parts).strip()
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
         for attr in ("completion_text", "text", "content", "message"):
@@ -290,7 +300,7 @@ class LLMClient:
                 val = getattr(llm_resp, attr, None)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-            except Exception:
+            except (AttributeError, TypeError):
                 pass
 
         try:
@@ -311,7 +321,7 @@ class LLMClient:
                         text = getattr(first, "text", None)
                         if isinstance(text, str) and text.strip():
                             return text.strip()
-        except Exception:
+        except (AttributeError, TypeError, KeyError):
             pass
 
         try:
@@ -328,7 +338,7 @@ class LLMClient:
                     text = getattr(first, "text", None)
                     if isinstance(text, str) and text.strip():
                         return text.strip()
-        except Exception:
+        except (AttributeError, TypeError, KeyError):
             pass
 
         return "（未解析到可读内容）"
