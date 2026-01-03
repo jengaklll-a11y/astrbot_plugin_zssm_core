@@ -24,19 +24,11 @@ from .message_utils import ob_data
 
 
 def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
-    """安全执行子进程调用。
-    安全措施：
-    - 强制使用参数列表（非 shell 字符串），并显式设置 shell=False，避免 shell 注入
-    - 调用前验证 cmd 必须是非空字符串列表
-    - 丢弃 stdin，避免外部程序等待交互输入导致阻塞
-    - cmd 参数仅由本插件内部构造，不接受外部用户输入
-    """
     if not isinstance(cmd, list) or not cmd:
         raise ValueError("cmd must be a non-empty list")
     if not all(isinstance(x, str) for x in cmd):
         raise TypeError("cmd items must be str")
-    # Security: shell=False with validated list args; cmd is constructed internally, not from user input
-    return subprocess.run(  # nosec B603
+    return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -80,7 +72,6 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
             if hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
                 f = getattr(seg, "file", None)
                 u = getattr(seg, "url", None)
-                # 对于视频组件，优先使用 URL，其次才回退到 file/path
                 if isinstance(u, str) and u:
                     videos.append(u)
                 elif isinstance(f, str) and f:
@@ -141,8 +132,6 @@ def is_abs_file(s: Optional[str]) -> bool:
 
 def is_napcat(event: AstrMessageEvent) -> bool:
     try:
-        # AstrBot 的 OneBot/Napcat 适配器在不同环境下 platform_name 可能不同（如 bridge/onebot_v11 等），
-        # 这里以是否具备 OneBot 风格的 call_action 能力作为主要判断依据。
         if not (hasattr(event, "bot") and hasattr(event.bot, "api")):
             return False
         api = getattr(event.bot, "api", None)
@@ -156,19 +145,10 @@ def is_napcat(event: AstrMessageEvent) -> bool:
 async def napcat_resolve_file_url(
     event: AstrMessageEvent, file_id: str
 ) -> Optional[str]:
-    """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL 或本地路径。
-
-    说明：
-    - 群文件：通常可用 get_group_file_url / get_private_file_url
-    - 媒体（如视频/图片/语音）在部分场景下需要使用 get_file/get_image/get_record 等接口
-      才能解析出 url/file，本函数目前以 get_file 作为兜底（兼容合并转发里的 video fileUUID）。
-    """
     if not (isinstance(file_id, str) and file_id):
         return None
     if not is_napcat(event):
         return None
-    # 优先根据上下文决定调用顺序：群聊先尝试群文件接口，再尝试私聊文件接口；
-    # 私聊则只调用 get_private_file_url。
     try:
         gid = event.get_group_id()
     except Exception:
@@ -187,28 +167,8 @@ async def napcat_resolve_file_url(
         try:
             base, ext = os.path.splitext(s)
             if ext and ext.lower() in (
-                # 视频
-                ".mp4",
-                ".mov",
-                ".m4v",
-                ".avi",
-                ".webm",
-                ".mkv",
-                ".flv",
-                ".wmv",
-                ".ts",
-                ".mpeg",
-                ".mpg",
-                ".3gp",
-                # 图片（Napcat/OneBot 常见为 md5 + 扩展名，部分接口需要 md5 本体）
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".webp",
-                ".bmp",
-                ".tif",
-                ".tiff",
-                ".gif",
+                ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp",
+                ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
             ):
                 if base and base != s:
                     return base
@@ -216,24 +176,20 @@ async def napcat_resolve_file_url(
             pass
         return None
 
-    # 一些 Napcat 场景下 file 值会携带扩展名（形如 md5.jpg / md5.mp4），但接口实际需要 md5 本体。
     candidates: List[str] = [file_id]
     stem = _stem_if_needed(file_id)
     if isinstance(stem, str) and stem and stem not in candidates:
         candidates.append(stem)
 
     actions: List[Dict[str, Any]] = []
-    # 兜底：Napcat 通用文件解析接口（可用于 message 视频/图片等的 file_id/fileUUID）
     for fid in candidates:
         actions.append({"action": "get_file", "params": {"file_id": fid}})
         actions.append({"action": "get_file", "params": {"file": fid}})
-        # 图片在部分实现中需要 get_image 才能拿到本地路径或可下载 URL（优先尝试，失败则忽略）
         actions.append({"action": "get_image", "params": {"file": fid}})
         actions.append({"action": "get_image", "params": {"file_id": fid}})
         actions.append({"action": "get_image", "params": {"id": fid}})
         actions.append({"action": "get_image", "params": {"image": fid}})
 
-    # 群文件接口：仅在能拿到群号时尝试
     if group_id_param:
         for fid in candidates:
             actions.append(
@@ -258,191 +214,36 @@ async def napcat_resolve_file_url(
                 data = None
             url = data.get("url") if isinstance(data, dict) else None
             if isinstance(url, str) and url:
-                logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
                 return url
-            # get_file/get_image/get_record 等可能返回本地路径 file
             f = data.get("file") if isinstance(data, dict) else None
             if isinstance(f, str) and f:
                 lf = f.lower()
-                # OneBot 常见：base64://... 或 data:image/...;base64,...
                 if lf.startswith("base64://") or lf.startswith("data:image/"):
-                    logger.info(
-                        "zssm_explain: napcat %s ok, base64(%d)", action, len(f)
-                    )
                     return f
-                # OneBot 常见：file://...
                 if lf.startswith("file://"):
                     try:
                         fp = f[7:]
-                        # Windows: file:///C:/xxx
                         if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
                             fp = fp[1:]
                         if fp and os.path.exists(fp):
                             fp = os.path.abspath(fp)
-                            logger.info(
-                                "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
-                            )
                             return fp
                     except Exception:
                         pass
-                # 绝对路径或相对路径（存在则提升为绝对路径）
                 try:
                     if os.path.isabs(f) and os.path.exists(f):
-                        logger.info(
-                            "zssm_explain: napcat %s ok, file=%s", action, f[:80]
-                        )
                         return f
                     if os.path.exists(f):
                         fp = os.path.abspath(f)
-                        logger.info(
-                            "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
-                        )
                         return fp
                 except Exception:
                     pass
-            logger.debug(
-                "zssm_explain: napcat %s returned no url/file (file_id=%s params=%s)",
-                action,
-                str(file_id)[:64],
-                {
-                    k: str(v)[:64]
-                    for k, v in (params.items() if isinstance(params, dict) else [])
-                },
-            )
-        except Exception as e:
-            logger.debug(
-                "zssm_explain: napcat %s failed (file_id=%s params=%s): %s",
-                action,
-                str(file_id)[:64],
-                {
-                    k: str(v)[:64]
-                    for k, v in (params.items() if isinstance(params, dict) else [])
-                },
-                e,
-            )
-    logger.warning(
-        "zssm_explain: napcat resolve file/url failed (file_id=%s)", str(file_id)[:64]
-    )
+        except Exception:
+            continue
     return None
 
 
-def extract_videos_from_onebot_message_payload(
-    payload: Any, prefer_file_id: bool = False
-) -> List[str]:
-    """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。
-
-    - 默认行为：优先使用 url 字段，回退 file 字段（兼容通用 OneBot 实现）。
-    - 当 prefer_file_id=True 且存在 file 字段时，优先返回 file（用于 Napcat，结合 get_*_file_url
-      接口将 file_id 解析为下载 URL，避免直接使用可能不稳定的 url 字段）。
-    """
-    videos: List[str] = []
-    data = ob_data(payload) if isinstance(payload, dict) else {}
-    if isinstance(data, dict):
-        candidates = (
-            data.get("message")
-            or data.get("messages")
-            or data.get("nodes")
-            or data.get("nodeList")
-        )
-        if isinstance(candidates, list):
-            for seg in candidates:
-                try:
-                    if isinstance(seg, dict):
-                        if "type" in seg and "data" in seg:
-                            t = seg.get("type")
-                            d = seg.get("data") or {}
-                            if isinstance(d, dict):
-                                if t == "video":
-                                    # 对于 OneBot/Napcat 视频段，优先使用 url 字段，
-                                    # file 字段通常为内部标识，不直接作为下载链接。
-                                    url = d.get("url") or d.get("file")
-                                    if isinstance(url, str) and url:
-                                        videos.append(url)
-                                elif t == "file":
-                                    url = d.get("url") or d.get("file")
-                                    name = d.get("name") or d.get("filename")
-
-                                    def _looks_like_video(name_or_url: str) -> bool:
-                                        if (
-                                            not isinstance(name_or_url, str)
-                                            or not name_or_url
-                                        ):
-                                            return False
-                                        s = name_or_url.lower()
-                                        return any(
-                                            s.endswith(ext)
-                                            for ext in (
-                                                ".mp4",
-                                                ".mov",
-                                                ".m4v",
-                                                ".avi",
-                                                ".webm",
-                                                ".mkv",
-                                                ".flv",
-                                                ".wmv",
-                                                ".ts",
-                                                ".mpeg",
-                                                ".mpg",
-                                                ".3gp",
-                                                ".gif",
-                                            )
-                                        )
-
-                                    if (
-                                        isinstance(url, str)
-                                        and url
-                                        and _looks_like_video(url)
-                                    ):
-                                        videos.append(url)
-                                    elif (
-                                        isinstance(name, str)
-                                        and _looks_like_video(name)
-                                        and isinstance(url, str)
-                                        and url
-                                    ):
-                                        videos.append(url)
-                        else:
-                            content = seg.get("content") or seg.get("message")
-                            if isinstance(content, list):
-                                inner = extract_videos_from_onebot_message_payload(
-                                    {"message": content}, prefer_file_id=prefer_file_id
-                                )
-                                videos.extend(inner)
-                except Exception:
-                    continue
-    return videos
-
-
-def extract_videos_from_onebot_forward_payload(payload: Any) -> List[str]:
-    """解析 OneBot get_forward_msg 返回的 messages/nodes/nodeList，汇总其中的视频 URL/路径。"""
-    videos: List[str] = []
-    data = ob_data(payload) if isinstance(payload, dict) else {}
-    if isinstance(data, dict):
-        msgs = (
-            data.get("messages")
-            or data.get("message")
-            or data.get("nodes")
-            or data.get("nodeList")
-        )
-        if isinstance(msgs, list):
-            for node in msgs:
-                try:
-                    content = None
-                    if isinstance(node, dict):
-                        content = node.get("content") or node.get("message")
-                    if isinstance(content, list):
-                        inner = extract_videos_from_onebot_message_payload(
-                            {"message": content}
-                        )
-                        if inner:
-                            videos.extend(inner)
-                except Exception:
-                    continue
-    return videos
-
-
 def resolve_ffmpeg(config_path: str, default_path: str) -> Optional[str]:
-    """解析 ffmpeg 可执行路径，优先使用配置路径，其次系统路径/ imageio-ffmpeg。"""
     path = config_path or default_path
     if path and shutil.which(path):
         return shutil.which(path)
@@ -461,7 +262,6 @@ def resolve_ffmpeg(config_path: str, default_path: str) -> Optional[str]:
 
 
 def resolve_ffprobe(ffmpeg_path: Optional[str]) -> Optional[str]:
-    """解析 ffprobe 可执行路径：优先系统 ffprobe，其次与 ffmpeg 同目录。"""
     sys_ffprobe = shutil.which("ffprobe")
     if sys_ffprobe:
         return sys_ffprobe
@@ -478,10 +278,6 @@ async def sample_frames_with_ffmpeg(
     interval_sec: int,
     count_limit: int,
 ) -> List[str]:
-    """按 fps=1/interval 抽帧，返回帧图片路径列表（均位于同一临时目录）。
-
-    注意：调用方负责删除返回路径所在目录。
-    """
     out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
     out_tpl = os.path.join(out_dir, "frame_%03d.jpg")
     cmd = [
@@ -508,9 +304,6 @@ async def sample_frames_with_ffmpeg(
             shutil.rmtree(out_dir, ignore_errors=True)
         except Exception:
             pass
-        logger.error(
-            "zssm_explain: ffmpeg fps-sampler failed (code=%s)", res.returncode
-        )
         raise RuntimeError("ffmpeg sample frames failed")
 
     frames: List[str] = []
@@ -536,10 +329,6 @@ async def sample_frames_equidistant(
     duration_sec: float,
     count_limit: int,
 ) -> List[str]:
-    """按等距时间点抽帧，覆盖全片。选择 N 个时间点：t_i = (i/(N+1))*duration。
-
-    注意：调用方负责删除返回路径所在目录。
-    """
     N = max(1, int(count_limit))
     out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
     loop = asyncio.get_running_loop()
@@ -550,7 +339,6 @@ async def sample_frames_equidistant(
         for i in range(1, N + 1):
             t = (i / (N + 1.0)) * total
             times.append(t)
-        logger.info("zssm_explain: equidistant times=%s", [round(x, 2) for x in times])
         for idx, t in enumerate(times, start=1):
             out_path = os.path.join(out_dir, f"frame_{idx:03d}.jpg")
             cmd = [
@@ -573,12 +361,6 @@ async def sample_frames_equidistant(
             res = await loop.run_in_executor(None, _run_one)
             if res.returncode == 0 and os.path.exists(out_path):
                 frames.append(out_path)
-            else:
-                logger.warning(
-                    "zssm_explain: ffmpeg sample at %.3fs failed (code=%s)",
-                    t,
-                    res.returncode,
-                )
     except Exception as e:
         logger.error("zssm_explain: equidistant sampler error: %s", e)
     if not frames:
@@ -590,47 +372,9 @@ async def sample_frames_equidistant(
     return frames
 
 
-async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
-    """从视频抽取单声道 16kHz wav，返回临时文件路径（由调用方负责删除）。"""
-    out_fd, out_path = tempfile.mkstemp(prefix="zssm_audio_", suffix=".wav")
-    os.close(out_fd)
-    cmd = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        video_path,
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-f",
-        "wav",
-        out_path,
-    ]
-    loop = asyncio.get_running_loop()
-
-    def _run():
-        return _safe_subprocess_run(cmd)
-
-    res = await loop.run_in_executor(None, _run)
-    if res.returncode != 0:
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
-        return None
-    return out_path if os.path.exists(out_path) else None
-
-
 async def download_video_to_temp(
     url: str, size_mb_limit: int, headers: Optional[Dict[str, str]] = None
 ) -> Optional[str]:
-    """下载视频到临时文件，做大小限制校验。
-
-    headers 可选，用于为特定站点（如 B 站）附加 UA/Referer 等。
-    """
-
     def _safe_ext_from_url(u: str) -> str:
         try:
             path = urlparse(u).path
@@ -641,14 +385,7 @@ async def download_video_to_temp(
             if not ext or not re.match(r"^\.[A-Za-z0-9]{1,6}$", ext):
                 lower = base.lower()
                 for cand in (
-                    ".mp4",
-                    ".mov",
-                    ".m4v",
-                    ".avi",
-                    ".webm",
-                    ".mkv",
-                    ".flv",
-                    ".wmv",
+                    ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv",
                 ):
                     if lower.endswith(cand):
                         return cand
@@ -735,7 +472,6 @@ async def download_video_to_temp(
 
 
 def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
-    """使用 ffprobe（format/stream/帧率信息）探测视频时长。"""
     if not ffprobe_path:
         return None
     candidates: List[float] = []
@@ -826,12 +562,8 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
     if not candidates:
         return None
     c_sorted = sorted(set(candidates))
-    logger.info(
-        "zssm_explain: ffprobe duration candidates=%s", [round(x, 3) for x in c_sorted]
-    )
     mid = len(c_sorted) // 2
     chosen = c_sorted[mid]
-    logger.info("zssm_explain: ffprobe chosen duration=%.3f", chosen)
     return chosen
 
 
@@ -847,12 +579,6 @@ async def extract_forward_video_keyframes(
     max_sec: int,
     timeout_sec: int,
 ) -> Tuple[List[str], List[str]]:
-    """将合并转发中的视频源转换为少量关键帧图片（默认每个视频 1 张），用于“聊天记录解释”场景。
-
-    返回:
-    - frames: 本地关键帧图片路径列表（均位于临时目录）
-    - cleanup_paths: 需要清理的临时路径（文件或目录）
-    """
     if not enabled:
         return ([], [])
     if not video_sources:
