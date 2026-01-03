@@ -25,8 +25,7 @@ class LLMClient:
         self._get_config_provider = get_config_provider
         self._logger = logger
 
-    @staticmethod
-    def filter_supported_images(images: List[str]) -> List[str]:
+    def filter_supported_images(self, images: List[str]) -> List[str]:
         ok: List[str] = []
         for x in images:
             try:
@@ -47,8 +46,9 @@ class LLMClient:
                             pass
                     elif os.path.exists(x):
                         ok.append(os.path.abspath(x))
-            except Exception:
-                pass
+            except Exception as e:
+                if self._logger:
+                    self._logger.warning(f"Error checking image support for {x}: {e}")
         return ok
 
     @staticmethod
