@@ -10,13 +10,7 @@ DEFAULT_LLM_TIMEOUT_SEC = 90
 
 
 class LLMClient:
-    """封装 LLM 调用与回退逻辑（Provider 选择 / 超时 / 输出解析）。
-
-    设计目标：
-    - main.py 只负责“业务流程编排”，LLM 细节在此模块收敛；
-    - 通过注入依赖（context / get_conf_int / get_config_provider）保持可替换性；
-    - 尽量保持对 AstrBot Provider 接口的最小假设（仅依赖 .text_chat）。
-    """
+    """封装 LLM 调用与回退逻辑。"""
 
     def __init__(
         self,
@@ -33,13 +27,6 @@ class LLMClient:
 
     @staticmethod
     def filter_supported_images(images: List[str]) -> List[str]:
-        """只保留看起来可被 LLM 读取的图片引用：
-
-        - http(s) 链接
-        - base64://... 或 data:image/...;base64,...
-        - file://...（转换为本地路径）
-        - 本地路径（绝对/相对，存在则通过）
-        """
         ok: List[str] = []
         for x in images:
             try:
@@ -47,21 +34,17 @@ class LLMClient:
                     lx = x.lower()
                     if lx.startswith(("http://", "https://")):
                         ok.append(x)
-                    # OneBot 常见：base64://... 或 data:image/...;base64,...
                     elif lx.startswith("base64://") or lx.startswith("data:image/"):
                         ok.append(x)
-                    # OneBot 常见：file://...
                     elif lx.startswith("file://"):
                         try:
                             fp = x[7:]
-                            # Windows: file:///C:/xxx
                             if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
                                 fp = fp[1:]
                             if fp and os.path.exists(fp):
                                 ok.append(os.path.abspath(fp))
                         except Exception:
                             pass
-                    # 本地路径：绝对/相对都接受（存在则通过）
                     elif os.path.exists(x):
                         ok.append(os.path.abspath(x))
             except Exception:
@@ -70,7 +53,6 @@ class LLMClient:
 
     @staticmethod
     def provider_supports_image(provider: Any) -> bool:
-        """尽力判断 Provider 是否支持图片/多模态。"""
         try:
             mods = getattr(provider, "modalities", None)
             if isinstance(mods, (list, tuple)):
@@ -105,7 +87,6 @@ class LLMClient:
 
     @staticmethod
     def _provider_label(provider: Any) -> str:
-        """尽量生成稳定可读的 Provider 标识，用于日志排查。"""
         if provider is None:
             return "None"
         for key in ("provider_id", "id", "name"):
@@ -128,12 +109,6 @@ class LLMClient:
         text_provider_key: str = "text_provider_id",
         image_provider_key: str = "image_provider_id",
     ) -> Any:
-        """根据是否包含图片选择首选 Provider。
-
-        - 图片：优先配置 image_provider_id；否则首选会话 Provider（需具备图片能力）；
-          否则从全部 Provider 中挑首个具备图片能力的；否则回退会话 Provider。
-        - 文本：优先配置 text_provider_id；否则采用会话 Provider。
-        """
         images_present = bool(image_urls)
         if images_present:
             cfg_img = self._get_provider_from_config(image_provider_key)
@@ -151,7 +126,6 @@ class LLMClient:
         preferred_provider: Optional[Any] = None,
         preferred_provider_key: Optional[str] = None,
     ) -> Any:
-        """选择一个尽可能支持图片的 Provider，用于图片/视频等多模态场景。"""
         pp = preferred_provider
         if pp is None and preferred_provider_key:
             pp = self._get_provider_from_config(preferred_provider_key)
@@ -170,6 +144,16 @@ class LLMClient:
                 return p
         return session_provider
 
+    def select_search_provider(
+        self,
+        *,
+        session_provider: Any,
+        search_provider_key: str = "search_provider_id"
+    ) -> Any:
+        """选择搜索专用的 Provider。如果未配置，回退到会话 Provider。"""
+        cfg_search = self._get_provider_from_config(search_provider_key)
+        return cfg_search if cfg_search is not None else session_provider
+
     def _get_provider_from_config(self, key: str) -> Optional[Any]:
         if not self._get_config_provider:
             return None
@@ -187,10 +171,6 @@ class LLMClient:
         system_prompt: str,
         image_urls: List[str],
     ) -> Any:
-        """执行 LLM 调用与统一回退：
-        - 先 primary，再 session_provider（若不同），然后遍历全部 Provider。
-        - 图片场景仅尝试具备图片能力的 Provider；文本场景尝试所有 Provider。
-        """
         tried = set()
         images_present = bool(image_urls)
         timeout_sec = self._get_conf_int(
@@ -274,8 +254,6 @@ class LLMClient:
             )
         sample_errors_str = ""
         if errors:
-            # Only include a few sample errors in the exception message and truncate to avoid
-            # excessively long error strings.
             max_samples = 3
             sample_errors = errors[:max_samples]
             sample_errors_str = "; ".join(sample_errors)
@@ -290,7 +268,6 @@ class LLMClient:
 
     @staticmethod
     def pick_llm_text(llm_resp: object) -> str:
-        # 1) 优先解析 AstrBot 的结果链（MessageChain）
         try:
             rc = getattr(llm_resp, "result_chain", None)
             chain = getattr(rc, "chain", None)
@@ -308,7 +285,6 @@ class LLMClient:
         except Exception:
             pass
 
-        # 2) 常见直接字段
         for attr in ("completion_text", "text", "content", "message"):
             try:
                 val = getattr(llm_resp, attr, None)
@@ -317,7 +293,6 @@ class LLMClient:
             except Exception:
                 pass
 
-        # 3) 原始补全（OpenAI 风格）
         try:
             rawc = getattr(llm_resp, "raw_completion", None)
             if rawc is not None:
@@ -339,7 +314,6 @@ class LLMClient:
         except Exception:
             pass
 
-        # 4) 顶层 choices 兜底
         try:
             choices = getattr(llm_resp, "choices", None)
             if isinstance(choices, list) and choices:
