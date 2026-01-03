@@ -1,12 +1,90 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional, Any, Dict
+import html
 import json
 import os
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
+
+# 最大递归深度限制
+MAX_FORWARD_RECURSION_DEPTH = 15
+
+
+def _extract_text_from_segment(seg: object, texts: List[str], images: List[str]) -> None:
+    """从单个消息段提取文本和图片"""
+    try:
+        if isinstance(seg, Comp.Plain):
+            txt = getattr(seg, "text", None)
+            if isinstance(txt, str) and txt:
+                texts.append(txt)
+        elif isinstance(seg, Comp.Image):
+            _extract_image_urls(seg, images)
+    except (AttributeError, TypeError) as e:
+        logger.debug(f"zssm_explain: extract segment failed: {e}")
+
+
+def _extract_image_urls(seg: object, images: List[str]) -> None:
+    """从图片段提取 URL"""
+    candidates: List[str] = []
+    # 尝试从各种属性中获取图片链接
+    for key in ("url", "file", "path", "src", "base64", "data"):
+        v = getattr(seg, key, None)
+        if isinstance(v, str) and v:
+            candidates.append(v)
+
+    # 尝试从 data 字典中获取
+    d = getattr(seg, "data", None)
+    if isinstance(d, dict):
+        for key in ("url", "file", "path", "src", "base64", "data"):
+            v = d.get(key)
+            if isinstance(v, str) and v:
+                candidates.append(v)
+
+    # 去重并添加
+    seen_local: set = set()
+    for c in candidates:
+        if c not in seen_local:
+            seen_local.add(c)
+            images.append(c)
+
+
+def _extract_nested_content(seg: object, texts: List[str], images: List[str]) -> None:
+    """处理嵌套节点"""
+    content = None
+
+    if hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
+        content = getattr(seg, "content", None)
+    elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
+        nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+        if isinstance(nodes, list):
+            for node in nodes:
+                c = getattr(node, "content", None)
+                if isinstance(c, list):
+                    t2, i2 = extract_text_and_images_from_chain(c)
+                    if t2:
+                        texts.append(t2)
+                    images.extend(i2)
+        return
+    elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
+        nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+        if isinstance(nodes, list):
+            for node in nodes:
+                c = getattr(node, "content", None)
+                if isinstance(c, list):
+                    t2, i2 = extract_text_and_images_from_chain(c)
+                    if t2:
+                        texts.append(t2)
+                    images.extend(i2)
+        return
+
+    if isinstance(content, list):
+        t2, i2 = extract_text_and_images_from_chain(content)
+        if t2:
+            texts.append(t2)
+        images.extend(i2)
 
 
 def extract_text_and_images_from_chain(
@@ -17,71 +95,19 @@ def extract_text_and_images_from_chain(
     images: List[str] = []
     if not isinstance(chain, list):
         return ("", images)
-    
+
     for seg in chain:
         try:
-            if isinstance(seg, Comp.Plain):
-                txt = getattr(seg, "text", None)
-                if isinstance(txt, str) and txt:
-                    texts.append(txt)
-            elif isinstance(seg, Comp.Image):
-                candidates: List[str] = []
-                # 尝试从各种属性中获取图片链接
-                for key in ("url", "file", "path", "src", "base64", "data"):
-                    v = getattr(seg, key, None)
-                    if isinstance(v, str) and v:
-                        candidates.append(v)
-                
-                # 尝试从 data 字典中获取
-                d = getattr(seg, "data", None)
-                if isinstance(d, dict):
-                    for key in ("url", "file", "path", "src", "base64", "data"):
-                        v = d.get(key)
-                        if isinstance(v, str) and v:
-                            candidates.append(v)
-                
-                # 去重并添加
-                seen_local = set()
-                for c in candidates:
-                    if c not in seen_local:
-                        seen_local.add(c)
-                        images.append(c)
-            
-            # 处理嵌套节点 (Node, Nodes, Forward)
-            elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
-                content = getattr(seg, "content", None)
-                if isinstance(content, list):
-                    t2, i2 = extract_text_and_images_from_chain(content)
-                    if t2:
-                        texts.append(t2)
-                    images.extend(i2)
-            elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
-                nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                if isinstance(nodes, list):
-                    for node in nodes:
-                        c = getattr(node, "content", None)
-                        if isinstance(c, list):
-                            t2, i2 = extract_text_and_images_from_chain(c)
-                            if t2:
-                                texts.append(t2)
-                            images.extend(i2)
-            elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
-                nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                if isinstance(nodes, list):
-                    for node in nodes:
-                        c = getattr(node, "content", None)
-                        if isinstance(c, list):
-                            t2, i2 = extract_text_and_images_from_chain(c)
-                            if t2:
-                                texts.append(t2)
-                            images.extend(i2)
+            _extract_text_from_segment(seg, texts, images)
+            _extract_nested_content(seg, texts, images)
         except (AttributeError, TypeError, ValueError) as e:
-            logger.warning(f"zssm_explain: parse chain segment failed: {e}")
-            
+            logger.debug(f"zssm_explain: parse chain segment failed: {e}")
+
     return ("\n".join([t for t in texts if t]).strip(), images)
 
 
 def chain_has_forward(chain: List[object]) -> bool:
+    """检查消息链是否包含转发消息"""
     if not isinstance(chain, list):
         return False
     for seg in chain:
@@ -92,12 +118,13 @@ def chain_has_forward(chain: List[object]) -> bool:
                 return True
             if hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
                 return True
-        except Exception:
+        except (AttributeError, TypeError):
             continue
     return False
 
 
 def _strip_bracket_prefix(text: str) -> str:
+    """移除方括号前缀"""
     if not isinstance(text, str):
         return ""
     s = text.strip()
@@ -106,15 +133,16 @@ def _strip_bracket_prefix(text: str) -> str:
     if s.startswith("["):
         end = s.find("]")
         if end != -1:
-            return s[end + 1 :].strip()
+            return s[end + 1:].strip()
     if s.startswith("【"):
         end = s.find("】")
         if end != -1:
-            return s[end + 1 :].strip()
+            return s[end + 1:].strip()
     return s
 
 
 def _format_json_share(data: Dict[str, Any]) -> str:
+    """格式化 JSON 分享消息"""
     if not isinstance(data, dict):
         return ""
 
@@ -173,6 +201,7 @@ def _format_json_share(data: Dict[str, Any]) -> str:
 def try_extract_from_reply_component(
     reply_comp: object,
 ) -> Tuple[Optional[str], List[str], bool]:
+    """尝试从回复组件提取内容"""
     for attr in ("message", "origin", "content"):
         payload = getattr(reply_comp, attr, None)
         if isinstance(payload, list):
@@ -183,6 +212,7 @@ def try_extract_from_reply_component(
 
 
 def get_reply_message_id(reply_comp: object) -> Optional[str]:
+    """获取回复消息 ID"""
     for key in ("id", "message_id", "reply_id", "messageId", "message_seq"):
         val = getattr(reply_comp, key, None)
         if isinstance(val, (str, int)) and str(val):
@@ -197,6 +227,7 @@ def get_reply_message_id(reply_comp: object) -> Optional[str]:
 
 
 def ob_data(obj: Any) -> Dict[str, Any]:
+    """提取 OneBot 数据"""
     if isinstance(obj, dict):
         data = obj.get("data")
         if isinstance(data, dict):
@@ -208,6 +239,7 @@ def ob_data(obj: Any) -> Dict[str, Any]:
 async def call_get_msg(
     event: AstrMessageEvent, message_id: str
 ) -> Optional[Dict[str, Any]]:
+    """调用 get_msg API"""
     if not (isinstance(message_id, str) and message_id.strip()):
         return None
     if (
@@ -230,7 +262,7 @@ async def call_get_msg(
     for params in params_list:
         try:
             return await event.bot.api.call_action("get_msg", **params)
-        except Exception as e:
+        except (ConnectionError, TimeoutError, ValueError) as e:
             last_err = e
             continue
     if last_err:
@@ -241,6 +273,7 @@ async def call_get_msg(
 async def call_get_forward_msg(
     event: AstrMessageEvent, forward_id: str
 ) -> Optional[Dict[str, Any]]:
+    """调用 get_forward_msg API"""
     if not (isinstance(forward_id, str) and forward_id.strip()):
         return None
     if not hasattr(event, "bot") or not hasattr(event.bot, "api"):
@@ -259,7 +292,7 @@ async def call_get_forward_msg(
     for params in params_list:
         try:
             return await event.bot.api.call_action("get_forward_msg", **params)
-        except Exception as e:
+        except (ConnectionError, TimeoutError, ValueError) as e:
             last_err = e
             continue
     if last_err:
@@ -270,6 +303,7 @@ async def call_get_forward_msg(
 def extract_from_onebot_message_payload(
     payload: Any,
 ) -> Tuple[str, List[str]]:
+    """从 OneBot 消息载荷提取内容"""
     texts: List[str] = []
     images: List[str] = []
     data = ob_data(payload) if isinstance(payload, dict) else {}
@@ -298,8 +332,8 @@ def extract_from_onebot_message_payload(
                                 summary = _format_json_share(inner)
                                 if summary:
                                     texts.append(summary)
-                            except Exception as e:
-                                logger.warning(
+                            except json.JSONDecodeError as e:
+                                logger.debug(
                                     f"zssm_explain: parse json segment failed: {e}"
                                 )
                     elif t == "file":
@@ -312,8 +346,8 @@ def extract_from_onebot_message_payload(
                         if file_id:
                             parts.append(f"文件标识: {file_id}")
                         texts.append("\n".join(parts))
-                except Exception as e:
-                    logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
+                except (KeyError, TypeError, ValueError) as e:
+                    logger.debug(f"zssm_explain: parse onebot segment failed: {e}")
             return ("\n".join([t for t in texts if t]).strip(), images)
         elif isinstance(msg, str) and msg:
             texts.append(msg)
@@ -331,7 +365,15 @@ def _extract_forward_nodes_recursively(
     images: List[str],
     depth: int = 0,
 ) -> None:
+    """递归提取转发消息节点"""
     if not isinstance(message_nodes, list):
+        return
+
+    # 深度限制检查
+    if depth > MAX_FORWARD_RECURSION_DEPTH:
+        logger.warning(
+            f"zssm_explain: forward recursion depth exceeded {MAX_FORWARD_RECURSION_DEPTH}"
+        )
         return
 
     indent = "  " * depth
@@ -410,13 +452,14 @@ def _extract_forward_nodes_recursively(
             full_node_text = "".join(node_text_parts).strip()
             if full_node_text and not has_only_forward:
                 texts.append(f"{indent}{sender_name}: {full_node_text}")
-        except Exception as e:
-            logger.warning(f"zssm_explain: parse forward node failed: {e}")
+        except (KeyError, TypeError, ValueError) as e:
+            logger.debug(f"zssm_explain: parse forward node failed: {e}")
 
 
 def extract_from_onebot_forward_payload(
     payload: Any,
 ) -> Tuple[str, List[str]]:
+    """从 OneBot 转发消息载荷提取内容"""
     texts: List[str] = []
     images: List[str] = []
     data = ob_data(payload) if isinstance(payload, dict) else {}
@@ -430,17 +473,18 @@ def extract_from_onebot_forward_payload(
         if isinstance(msgs, list):
             try:
                 _extract_forward_nodes_recursively(msgs, texts, images, depth=0)
-            except Exception as e:
-                logger.warning(f"zssm_explain: parse forward payload failed: {e}")
+            except (KeyError, TypeError, ValueError) as e:
+                logger.debug(f"zssm_explain: parse forward payload failed: {e}")
     return ("\n".join([x for x in texts if x]).strip(), images)
 
 
 async def extract_quoted_payload(
     event: AstrMessageEvent,
 ) -> Tuple[Optional[str], List[str], bool]:
+    """提取被引用消息的内容"""
     try:
         chain = event.get_messages()
-    except Exception:
+    except (AttributeError, TypeError):
         chain = getattr(event.message_obj, "message", []) or []
 
     reply_comp = None
@@ -449,15 +493,13 @@ async def extract_quoted_payload(
             if isinstance(seg, Comp.Reply):
                 reply_comp = seg
                 break
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
     if not reply_comp:
         return (None, [], False)
 
-    text, images, from_forward = try_extract_from_reply_component(
-        reply_comp
-    )
+    text, images, from_forward = try_extract_from_reply_component(reply_comp)
     if text or images:
         return (text, images, from_forward)
 
@@ -488,16 +530,14 @@ async def extract_quoted_payload(
                             if isinstance(fid, (str, int)) and str(fid):
                                 try:
                                     fwd = await call_get_forward_msg(event, str(fid))
-                                    ft, fi = (
-                                        extract_from_onebot_forward_payload(
-                                            fwd or {}
-                                        )
+                                    ft, fi = extract_from_onebot_forward_payload(
+                                        fwd or {}
                                     )
                                     if ft:
                                         agg_texts.append(ft)
                                     if fi:
                                         agg_imgs.extend(fi)
-                                except Exception as fe:
+                                except (ConnectionError, TimeoutError) as fe:
                                     logger.warning(
                                         f"zssm_explain: get_forward_msg failed: {fe}"
                                     )
@@ -513,9 +553,8 @@ async def extract_quoted_payload(
                                     isinstance(inner_data_str, str)
                                     and inner_data_str.strip()
                                 ):
-                                    inner_data_str = inner_data_str.replace(
-                                        "&#44;", ","
-                                    )
+                                    # 使用 html.unescape 进行完整的实体解码
+                                    inner_data_str = html.unescape(inner_data_str)
                                     inner_json = json.loads(inner_data_str)
                                     if (
                                         inner_json.get("app") == "com.tencent.multimsg"
@@ -545,14 +584,14 @@ async def extract_quoted_payload(
                                 logger.debug(
                                     f"zssm_explain: parse multimsg json in get_msg failed: {je}"
                                 )
-            except Exception:
+            except (KeyError, TypeError):
                 pass
             if agg_texts or agg_imgs:
                 logger.info("zssm_explain: fetched origin via get_msg")
 
                 def _uniq(items: List[str]) -> List[str]:
                     uniq: List[str] = []
-                    seen = set()
+                    seen: set = set()
                     for it in items:
                         if isinstance(it, str) and it and it not in seen:
                             seen.add(it)
@@ -564,13 +603,14 @@ async def extract_quoted_payload(
                     _uniq(agg_imgs),
                     from_forward_ob,
                 )
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             logger.warning(f"zssm_explain: get_msg failed: {e}")
 
     return (None, [], False)
 
 
 def is_napcat(event: AstrMessageEvent) -> bool:
+    """检查是否为 Napcat 环境"""
     try:
         if not (hasattr(event, "bot") and hasattr(event.bot, "api")):
             return False
@@ -578,7 +618,7 @@ def is_napcat(event: AstrMessageEvent) -> bool:
         if api is None or not hasattr(api, "call_action"):
             return False
         return True
-    except Exception:
+    except (AttributeError, TypeError):
         return False
 
 
@@ -592,7 +632,7 @@ async def napcat_resolve_file_url(
         return None
     try:
         gid = event.get_group_id()
-    except Exception:
+    except (AttributeError, TypeError):
         gid = None
 
     group_id_param: Any = gid
@@ -601,7 +641,7 @@ async def napcat_resolve_file_url(
             group_id_param = int(gid)
         elif isinstance(gid, int):
             group_id_param = gid
-    except Exception:
+    except (ValueError, TypeError):
         group_id_param = gid
 
     def _stem_if_needed(s: str) -> Optional[str]:
@@ -609,11 +649,18 @@ async def napcat_resolve_file_url(
             base, ext = os.path.splitext(s)
             # 仅保留图片格式，移除视频格式
             if ext and ext.lower() in (
-                ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+                ".tif",
+                ".tiff",
+                ".gif",
             ):
                 if base and base != s:
                     return base
-        except Exception:
+        except (ValueError, TypeError):
             pass
         return None
 
@@ -669,7 +716,7 @@ async def napcat_resolve_file_url(
                         if fp and os.path.exists(fp):
                             fp = os.path.abspath(fp)
                             return fp
-                    except Exception:
+                    except OSError:
                         pass
                 try:
                     if os.path.isabs(f) and os.path.exists(f):
@@ -677,8 +724,8 @@ async def napcat_resolve_file_url(
                     if os.path.exists(f):
                         fp = os.path.abspath(f)
                         return fp
-                except Exception:
+                except OSError:
                     pass
-        except Exception:
+        except (ConnectionError, TimeoutError, ValueError):
             continue
     return None
