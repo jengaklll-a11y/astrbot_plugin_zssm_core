@@ -4,6 +4,7 @@ from typing import Iterable, Optional, Set, Dict, Any, List
 import os
 import io
 import re
+import asyncio
 
 try:
     import aiohttp  # type: ignore[import-not-found]
@@ -85,7 +86,8 @@ def _normalize_pdf_page_text(raw: Optional[str]) -> str:
     return "\n\n".join(blocks).strip()
 
 
-def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
+def _pdf_bytes_to_markdown_sync(data: bytes, max_pages: Optional[int] = None) -> str:
+    """同步执行的 PDF 解析逻辑，应在线程池中运行。"""
     if not data:
         return ""
 
@@ -132,6 +134,14 @@ def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
         if text:
             md_pages_fallback.append(f"### 第 {idx} 页\n\n{text}")
     return "\n\n---\n\n".join(md_pages_fallback).strip()
+
+
+async def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
+    """异步封装的 PDF 解析。"""
+    if not data:
+        return ""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _pdf_bytes_to_markdown_sync, data, max_pages)
 
 
 def _find_first_file_in_message_list(msg_list: List[Any]) -> Optional[Dict[str, Any]]:
@@ -366,7 +376,7 @@ async def build_group_file_preview(
                                     "（文件体积较大，已跳过内容预览，仅展示元信息）"
                                 )
                                 return "\n".join(meta_lines)
-                    if is_pdf and PyPDF2 is not None:
+                    if is_pdf and (fitz is not None or PyPDF2 is not None):
                         limit = 2 * 1024 * 1024
                         buf = io.BytesIO()
                         total = 0
@@ -379,7 +389,8 @@ async def build_group_file_preview(
                             buf.write(chunk)
                         try:
                             pdf_bytes = buf.getvalue()
-                            text = pdf_bytes_to_markdown(pdf_bytes)
+                            # 异步调用 PDF 解析
+                            text = await pdf_bytes_to_markdown(pdf_bytes)
                         except Exception as e:
                             logger.warning(
                                 f"zssm_explain: pdf text extract failed: {e}"
