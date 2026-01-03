@@ -27,24 +27,6 @@ DEFAULT_IMAGE_USER_PROMPT = (
     "{text_block}\n包含图片：若无法直接读取图片，请结合上下文或文件名描述。"
 )
 
-DEFAULT_URL_USER_PROMPT = (
-    "你将看到一个网页的关键信息，请输出简版摘要（2-8句，中文）。禁止输出政治有关内容。"
-    "避免口水话，保留事实与结论，适当含链接上下文。\n"
-    "网址: {url}\n"
-    "标题: {title}\n"
-    "描述: {desc}\n"
-    "正文片段: \n{snippet}"
-)
-
-DEFAULT_VIDEO_USER_PROMPT = (
-    "请解释这段视频的主要内容，输出简洁不超过100字。仅依据提供的关键帧与音频转写（如有）作答；禁止输出政治有关内容。"
-    "若信息不足请明确说明‘无法判断’，不要编造未出现的内容。\n"
-    "{meta_block}\n{asr_block}"
-)
-
-# 单帧描述提示词（逐帧多次调用使用）
-DEFAULT_FRAME_CAPTION_PROMPT = "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。禁止输出政治有关内容。"
-
 
 def build_user_prompt(text: Optional[str], images: List[str]) -> str:
     """根据是否包含图片选择文本/图文提示词模板。"""
@@ -58,41 +40,11 @@ def build_system_prompt() -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
-async def build_system_prompt_for_event(
-    context: Any,
-    umo: Any,
-    *,
-    keep_original_persona: bool,
+def build_system_prompt_for_event(
+    custom_persona_setting: str = "",
 ) -> str:
-    """根据会话人格（可选）构造系统提示词。
-
-    - keep_original_persona=False：直接返回默认系统提示词；
-    - keep_original_persona=True：若 context.persona_manager 存在，则尝试读取当前会话人格 prompt，
-      并替换默认系统提示词的首行（保留其余结构化输出约束）。
-    """
-    sp = build_system_prompt()
-    if not keep_original_persona:
-        return sp
-
-    persona_mgr = getattr(context, "persona_manager", None)
-    if persona_mgr is None:
-        return sp
-
-    persona_prompt: Optional[str] = None
-    try:
-        personality = await persona_mgr.get_default_persona_v3(umo)
-        if isinstance(personality, dict):
-            persona_prompt = personality.get("prompt")
-        else:
-            persona_prompt = getattr(personality, "prompt", None)
-    except Exception:
-        persona_prompt = None
-
-    if not isinstance(persona_prompt, str) or not persona_prompt.strip():
-        return sp
-
-    base_lines = sp.splitlines()
-    rest_lines = base_lines[1:] if len(base_lines) > 1 else []
-    merged_lines: List[str] = [persona_prompt.strip()]
-    merged_lines.extend(rest_lines)
-    return "\n".join(merged_lines)
+    """根据配置构造系统提示词。"""
+    
+    # 优先使用用户配置的 custom_persona_setting，否则使用默认代码常量
+    sp = custom_persona_setting if custom_persona_setting.strip() else DEFAULT_SYSTEM_PROMPT
+    return sp
